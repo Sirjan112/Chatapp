@@ -239,7 +239,11 @@ jobs:
           cat > /tmp/deploy-remote.sh <<'REMOTE'
           set -euo pipefail
           cd /opt/chatapp
-          npm install --omit=dev --no-audit --no-fund
+          # --ignore-scripts: root package.json's postinstall runs `npm --prefix frontend
+          # install`, but the frontend source isn't pushed here (only its already-built
+          # dist/) - the frontend is built in CI instead. Without this flag that postinstall
+          # fails with ENOENT looking for frontend/package.json.
+          npm install --omit=dev --ignore-scripts --no-audit --no-fund
 
           sudo rm -rf /usr/share/nginx/html/*
           sudo cp -r /home/ec2-user/frontend-dist/* /usr/share/nginx/html/

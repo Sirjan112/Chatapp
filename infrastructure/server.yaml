@@ -118,10 +118,14 @@ Resources:
 
           echo "=== [1/5] install nginx, node, rsync (retried: dnf mirrors are flaky at boot) ==="
           for attempt in 1 2 3 4 5; do
-            dnf install -y nginx nodejs npm rsync && break
+            # nodejs20 if the repo has it (AL2023's plain "nodejs" package can lag behind
+            # what @supabase/supabase-js's engines field wants); fall back otherwise.
+            dnf install -y nginx rsync && { dnf install -y nodejs20 nodejs20-npm || dnf install -y nodejs npm; } && break
             echo "attempt $attempt failed, retrying in 10s"
             sleep 10
           done
+          command -v node >/dev/null || { echo "::error:: node did not install"; exit 1; }
+          [ -e /usr/bin/node ] || ln -s "$(command -v node)" /usr/bin/node
           mkdir -p $WEBROOT
           mkdir -p $APPDIR
           chown -R ec2-user:ec2-user $APPDIR
