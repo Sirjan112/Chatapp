@@ -276,6 +276,18 @@ jobs:
             sleep 10
           done
 
+      - name: Diagnose the chat server
+        run: |
+          set -uo pipefail
+          IP='${{ steps.out.outputs.ip }}'
+          SSH_OPTS="-o StrictHostKeyChecking=no -o ConnectTimeout=10 -i $HOME/.ssh/lab.pem"
+          echo "--- systemctl status chatapp ---"
+          ssh $SSH_OPTS ec2-user@"$IP" "sudo systemctl status chatapp --no-pager -l" || true
+          echo "--- journalctl -u chatapp (last 80 lines) ---"
+          ssh $SSH_OPTS ec2-user@"$IP" "sudo journalctl -u chatapp -n 80 --no-pager" || true
+          echo "--- what's listening on 8080 ---"
+          ssh $SSH_OPTS ec2-user@"$IP" "sudo ss -tlnp | grep 8080 || echo 'nothing on 8080'" || true
+
       - name: Verify what is actually live
         run: |
           IP='${{ steps.out.outputs.ip }}'

@@ -4,6 +4,11 @@ const supabase = require('./db');
 const wss = new WebSocket.Server({ port: 8080 });
 const clients = new Map();
 
+wss.on('error', (err) => {
+  console.error('❌ WebSocket server failed to bind on port 8080:', err.message);
+  process.exit(1);
+});
+
 function broadcastPresence() {
   const onlineUsernames = Array.from(clients.keys());
   const payload = JSON.stringify({
