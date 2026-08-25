@@ -1,4 +1,4 @@
-name: Deploy Website
+name: Deploy Chat App
 
 on:
   push:
@@ -43,6 +43,19 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
           aws-region: ${{ env.AWS_REGION }}
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Build the frontend
+        run: |
+          npm --prefix frontend ci
+          npm --prefix frontend run build
+          # Root deps (ws, @supabase/supabase-js) are intentionally NOT installed here:
+          # they're pure JS with no native build step, and get installed on the instance
+          # itself later so they always match its own Node runtime.
 
       - name: Validate template
         run: aws cloudformation validate-template --template-body file://"$TEMPLATE" >/dev/null
@@ -154,11 +167,6 @@ jobs:
       - name: Deploy the server
         run: |
           set -euo pipefail
-          # Derived, never hardcoded: GITHUB_REPOSITORY is always "owner/repo", so this
-          # keeps working after a fork or a rename.
-          OWNER="${GITHUB_REPOSITORY%%/*}"
-          REPO="${GITHUB_REPOSITORY#*/}"
-
           aws cloudformation deploy \
             --template-file "$TEMPLATE" \
             --stack-name '${{ steps.env.outputs.stack }}' \
@@ -166,9 +174,6 @@ jobs:
             --tags Environment=${{ steps.env.outputs.name }} ManagedBy=github-actions \
             --parameter-overrides \
               EnvironmentName=${{ steps.env.outputs.name }} \
-              GitHubUser="$OWNER" \
-              GitHubRepo="$REPO" \
-              GitBranch=${{ github.ref_name }} \
               VpcId=${{ steps.net.outputs.vpc_id }} \
               SubnetId=${{ steps.net.outputs.subnet_id }} \
               InstanceType=$INSTANCE_TYPE \
@@ -197,7 +202,7 @@ jobs:
         run: |
           set -uo pipefail
           IP='${{ steps.out.outputs.ip }}'
-          # A fresh instance needs to boot and install nginx (90-180s). Poll instead of
+          # A fresh instance needs to boot and install nginx/node (90-180s). Poll instead of
           # sleeping a fixed time, so an update deploy is not artificially slow.
           for i in $(seq 1 40); do
             CODE=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "http://$IP/health" || echo 000)
@@ -215,35 +220,65 @@ jobs:
             --output table || true
           exit 1
 
-      - name: Push this commit to the server
+      - name: Push the app to the server
         env:
           SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
         run: |
           set -euo pipefail
           IP='${{ steps.out.outputs.ip }}'
-          mkdir -p ~/.ssh
-          printf '%s\n' "$SSH_KEY" > ~/.ssh/lab.pem
-          chmod 600 ~/.ssh/lab.pem
+          mkdir -p "$HOME/.ssh"
+          printf '%s\n' "$SSH_KEY" > "$HOME/.ssh/lab.pem"
+          chmod 600 "$HOME/.ssh/lab.pem"
+          SSH_OPTS="-o StrictHostKeyChecking=no -o ConnectTimeout=10 -i $HOME/.ssh/lab.pem"
 
-          # The commit sha, not the branch name: this pins the page to exactly the code
-          # that triggered the run, not to whatever the branch points at a minute later.
+          # The commands that run ON the instance once files and secrets have arrived.
+          # A plain (quoted) heredoc, written locally first, so it never has to survive
+          # being embedded inside a remote ssh command string.
+          cat > /tmp/deploy-remote.sh <<'REMOTE'
+          set -euo pipefail
+          cd /opt/chatapp
+          npm install --omit=dev --no-audit --no-fund
+
+          sudo rm -rf /usr/share/nginx/html/*
+          sudo cp -r /home/ec2-user/frontend-dist/* /usr/share/nginx/html/
+          printf 'ok\n' | sudo tee /usr/share/nginx/html/health >/dev/null
+          sudo chown -R nginx:nginx /usr/share/nginx/html
+
+          sudo systemctl restart chatapp
+          sudo systemctl reload nginx || sudo systemctl restart nginx
+          REMOTE
+
+          # Retry the whole push: SSH may not be ready the instant /health starts answering,
+          # since nginx and sshd come up independently during boot.
           n=0
-          until ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -i ~/.ssh/lab.pem \
-                ec2-user@"$IP" "sudo /usr/local/bin/render-site.sh ${{ github.sha }}"; do
+          until
+            rsync -az -e "ssh $SSH_OPTS" \
+              server.js db.js package.json \
+              ec2-user@"$IP":/opt/chatapp/ \
+            && rsync -az --delete -e "ssh $SSH_OPTS" \
+              frontend/dist/ \
+              ec2-user@"$IP":/home/ec2-user/frontend-dist/ \
+            && printf 'SUPABASE_URL=%s\nSUPABASE_SERVICE_ROLE_KEY=%s\n' \
+                 "$SUPABASE_URL" "$SUPABASE_SERVICE_ROLE_KEY" \
+               | ssh $SSH_OPTS ec2-user@"$IP" \
+                 'cat > /opt/chatapp/.env && chmod 600 /opt/chatapp/.env' \
+            && ssh $SSH_OPTS ec2-user@"$IP" bash < /tmp/deploy-remote.sh
+          do
             n=$((n+1))
             [ "$n" -lt 8 ] || { echo "::error::could not reach the server over SSH"; exit 1; }
-            echo "ssh not ready, retry $n"
+            echo "push failed, retry $n"
             sleep 10
           done
 
       - name: Verify what is actually live
         run: |
           IP='${{ steps.out.outputs.ip }}'
-          SHORT=$(echo '${{ github.sha }}' | cut -c1-7)
-          PAGE=$(curl -s --max-time 15 "http://$IP/")
-          echo "$PAGE" | grep -q "$SHORT" \
-            && echo "Live version is $SHORT" \
-            || echo "Warning: the page does not show $SHORT"
+          CODE=$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 "http://$IP/")
+          [ "$CODE" = "200" ] \
+            && echo "Frontend is live ($CODE)" \
+            || echo "Warning: frontend returned $CODE"
 
       - name: Summary
         run: |
@@ -253,6 +288,7 @@ jobs:
             echo "| | |"
             echo "|---|---|"
             echo "| URL | http://${{ steps.out.outputs.ip }} |"
+            echo "| WebSocket | ws://${{ steps.out.outputs.ip }}:8080 |"
             echo "| Stack | ${{ steps.env.outputs.stack }} |"
             echo "| Branch | ${{ github.ref_name }} |"
             echo "| Commit | ${{ github.sha }} |"
