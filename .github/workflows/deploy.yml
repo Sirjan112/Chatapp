@@ -1,0 +1,259 @@
+name: Deploy Website
+
+on:
+  push:
+    branches: [main, dev]
+  workflow_dispatch:
+
+# Two pushes at once make CloudFormation throw "stack is in UPDATE_IN_PROGRESS".
+# Queue them instead of racing.
+concurrency:
+  group: deploy-${{ github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-east-1
+  TEMPLATE: infrastructure/server.yaml
+  INSTANCE_TYPE: t3.micro
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Pick the environment from the branch
+        id: env
+        run: |
+          set -euo pipefail
+          # main -> prod, dev -> dev. One stack per environment, so the two servers can
+          # never overwrite each other.
+          if [ "$GITHUB_REF_NAME" = "main" ]; then ENV=prod; else ENV=dev; fi
+          echo "name=$ENV"      >> "$GITHUB_OUTPUT"
+          echo "stack=web-$ENV" >> "$GITHUB_OUTPUT"
+          echo "Branch $GITHUB_REF_NAME -> environment $ENV"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Validate template
+        run: aws cloudformation validate-template --template-body file://"$TEMPLATE" >/dev/null
+
+      - name: Prepare the network
+        id: net
+        run: |
+          set -euo pipefail
+
+          # ---- 1. a default VPC -------------------------------------------------------
+          VPC_ID=$(aws ec2 describe-vpcs --filters Name=is-default,Values=true \
+            --query 'Vpcs[0].VpcId' --output text)
+          if [ "$VPC_ID" = "None" ]; then
+            echo "No default VPC in this account - creating one"
+            VPC_ID=$(aws ec2 create-default-vpc --query 'Vpc.VpcId' --output text)
+          fi
+          echo "VPC: $VPC_ID"
+
+          # ---- 2. an internet gateway attached to it ----------------------------------
+          # Without one, an instance gets a public IP that routes nowhere. The console
+          # calls this "the instance is not in a public subnet".
+          IGW=$(aws ec2 describe-internet-gateways \
+            --filters Name=attachment.vpc-id,Values="$VPC_ID" \
+            --query 'InternetGateways[0].InternetGatewayId' --output text)
+          if [ "$IGW" = "None" ]; then
+            echo "VPC has no internet gateway - creating and attaching one"
+            IGW=$(aws ec2 create-internet-gateway \
+              --query 'InternetGateway.InternetGatewayId' --output text)
+            aws ec2 attach-internet-gateway --internet-gateway-id "$IGW" --vpc-id "$VPC_ID"
+          fi
+          echo "IGW: $IGW"
+
+          # ---- 3. a subnet that actually routes to it ---------------------------------
+          SUBNETS=$(aws ec2 describe-subnets \
+            --filters Name=vpc-id,Values="$VPC_ID" Name=default-for-az,Values=true \
+            --query 'sort_by(Subnets,&AvailabilityZone)[].SubnetId' --output text | tr '\t' ' ')
+          if [ -z "$SUBNETS" ]; then
+            SUBNETS=$(aws ec2 describe-subnets --filters Name=vpc-id,Values="$VPC_ID" \
+              --query 'Subnets[].SubnetId' --output text | tr '\t' ' ')
+          fi
+          [ -n "$SUBNETS" ] || { echo "::error::VPC $VPC_ID has no subnets"; exit 1; }
+
+          # A subnet with no explicit route table association silently uses the VPC's main
+          # one, so that has to be the fallback rather than an error.
+          MAIN_RT=$(aws ec2 describe-route-tables \
+            --filters Name=vpc-id,Values="$VPC_ID" Name=association.main,Values=true \
+            --query 'RouteTables[0].RouteTableId' --output text)
+
+          route_table_for() {
+            RT=$(aws ec2 describe-route-tables \
+              --filters Name=association.subnet-id,Values="$1" \
+              --query 'RouteTables[0].RouteTableId' --output text)
+            [ "$RT" != "None" ] || RT="$MAIN_RT"
+            echo "$RT"
+          }
+          has_igw_route() {
+            [ "$1" != "None" ] || return 1
+            aws ec2 describe-route-tables --route-table-ids "$1" \
+              --query "RouteTables[0].Routes[?DestinationCidrBlock=='0.0.0.0/0'].GatewayId" \
+              --output text | grep -q '^igw-'
+          }
+
+          SUBNET_ID=""
+          for s in $SUBNETS; do
+            RT=$(route_table_for "$s")
+            if has_igw_route "$RT"; then
+              SUBNET_ID="$s"
+              echo "$s is public (route table $RT)"
+              break
+            fi
+          done
+
+          # ---- 4. repair, if none of them were public ---------------------------------
+          if [ -z "$SUBNET_ID" ]; then
+            s=$(echo $SUBNETS | awk '{print $1}')
+            RT=$(route_table_for "$s")
+            [ "$RT" != "None" ] || { echo "::error::subnet $s has no route table"; exit 1; }
+            echo "No public subnet found - adding 0.0.0.0/0 -> $IGW to $RT"
+            # create-route errors if the route already exists, which is harmless here.
+            aws ec2 create-route --route-table-id "$RT" \
+              --destination-cidr-block 0.0.0.0/0 --gateway-id "$IGW" >/dev/null || true
+            has_igw_route "$RT" || {
+              echo "::error::could not make $s public. Fix by hand: VPC -> Route tables -> $RT -> Edit routes -> add 0.0.0.0/0 -> $IGW"
+              exit 1
+            }
+            SUBNET_ID="$s"
+          fi
+
+          echo "vpc_id=$VPC_ID"       >> "$GITHUB_OUTPUT"
+          echo "subnet_id=$SUBNET_ID" >> "$GITHUB_OUTPUT"
+          echo "Using $VPC_ID / $SUBNET_ID"
+
+      - name: Clear a stack stuck in ROLLBACK
+        run: |
+          set -euo pipefail
+          # A stack in ROLLBACK_COMPLETE can never be updated, only deleted. Without this,
+          # every later push fails with a confusing "cannot update" error.
+          STACK='${{ steps.env.outputs.stack }}'
+          STATUS=$(aws cloudformation describe-stacks --stack-name "$STACK" \
+            --query 'Stacks[0].StackStatus' --output text 2>/dev/null || echo NONE)
+          echo "Current status: $STATUS"
+          case "$STATUS" in
+            ROLLBACK_COMPLETE|ROLLBACK_FAILED|DELETE_FAILED|REVIEW_IN_PROGRESS)
+              aws cloudformation delete-stack --stack-name "$STACK"
+              aws cloudformation wait stack-delete-complete --stack-name "$STACK"
+              ;;
+          esac
+
+      - name: Deploy the server
+        run: |
+          set -euo pipefail
+          # Derived, never hardcoded: GITHUB_REPOSITORY is always "owner/repo", so this
+          # keeps working after a fork or a rename.
+          OWNER="${GITHUB_REPOSITORY%%/*}"
+          REPO="${GITHUB_REPOSITORY#*/}"
+
+          aws cloudformation deploy \
+            --template-file "$TEMPLATE" \
+            --stack-name '${{ steps.env.outputs.stack }}' \
+            --no-fail-on-empty-changeset \
+            --tags Environment=${{ steps.env.outputs.name }} ManagedBy=github-actions \
+            --parameter-overrides \
+              EnvironmentName=${{ steps.env.outputs.name }} \
+              GitHubUser="$OWNER" \
+              GitHubRepo="$REPO" \
+              GitBranch=${{ github.ref_name }} \
+              VpcId=${{ steps.net.outputs.vpc_id }} \
+              SubnetId=${{ steps.net.outputs.subnet_id }} \
+              InstanceType=$INSTANCE_TYPE \
+              KeyName=vockey
+
+      - name: Show why, if it failed
+        if: failure()
+        run: |
+          aws cloudformation describe-stack-events --stack-name '${{ steps.env.outputs.stack }}' \
+            --query 'reverse(StackEvents[?ResourceStatus==`CREATE_FAILED`||ResourceStatus==`UPDATE_FAILED`].[Timestamp,LogicalResourceId,ResourceStatusReason])' \
+            --output table || true
+
+      - name: Read the server address
+        id: out
+        run: |
+          set -euo pipefail
+          IP=$(aws cloudformation describe-stacks --stack-name '${{ steps.env.outputs.stack }}' \
+            --query "Stacks[0].Outputs[?OutputKey=='PublicIp'].OutputValue" --output text)
+          # Fail here rather than spending seven minutes polling an empty address.
+          [ -n "$IP" ] && [ "$IP" != "None" ] \
+            || { echo "::error::the stack produced no public IP"; exit 1; }
+          echo "ip=$IP" >> "$GITHUB_OUTPUT"
+          echo "Server: $IP"
+
+      - name: Wait for the server to answer
+        run: |
+          set -uo pipefail
+          IP='${{ steps.out.outputs.ip }}'
+          # A fresh instance needs to boot and install nginx (90-180s). Poll instead of
+          # sleeping a fixed time, so an update deploy is not artificially slow.
+          for i in $(seq 1 40); do
+            CODE=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "http://$IP/health" || echo 000)
+            echo "[$i/40] GET /health -> $CODE"
+            [ "$CODE" = "200" ] && exit 0
+            sleep 10
+          done
+          echo "::error::server did not answer within ~7 minutes"
+          # 000 forty times over means nothing answered at all: read the boot log in
+          # EC2 -> Instances -> Actions -> Monitor and troubleshoot -> Get system log.
+          aws ec2 describe-instances \
+            --filters Name=tag:Name,Values=${{ steps.env.outputs.name }}-web-server \
+                      Name=instance-state-name,Values=running,pending \
+            --query 'Reservations[].Instances[].[InstanceId,State.Name,PublicIpAddress,SubnetId]' \
+            --output table || true
+          exit 1
+
+      - name: Push this commit to the server
+        env:
+          SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          IP='${{ steps.out.outputs.ip }}'
+          mkdir -p ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/lab.pem
+          chmod 600 ~/.ssh/lab.pem
+
+          # The commit sha, not the branch name: this pins the page to exactly the code
+          # that triggered the run, not to whatever the branch points at a minute later.
+          n=0
+          until ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -i ~/.ssh/lab.pem \
+                ec2-user@"$IP" "sudo /usr/local/bin/render-site.sh ${{ github.sha }}"; do
+            n=$((n+1))
+            [ "$n" -lt 8 ] || { echo "::error::could not reach the server over SSH"; exit 1; }
+            echo "ssh not ready, retry $n"
+            sleep 10
+          done
+
+      - name: Verify what is actually live
+        run: |
+          IP='${{ steps.out.outputs.ip }}'
+          SHORT=$(echo '${{ github.sha }}' | cut -c1-7)
+          PAGE=$(curl -s --max-time 15 "http://$IP/")
+          echo "$PAGE" | grep -q "$SHORT" \
+            && echo "Live version is $SHORT" \
+            || echo "Warning: the page does not show $SHORT"
+
+      - name: Summary
+        run: |
+          {
+            echo "## Deployed ${{ steps.env.outputs.name }}"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| URL | http://${{ steps.out.outputs.ip }} |"
+            echo "| Stack | ${{ steps.env.outputs.stack }} |"
+            echo "| Branch | ${{ github.ref_name }} |"
+            echo "| Commit | ${{ github.sha }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
